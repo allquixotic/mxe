@@ -1,0 +1,947 @@
+This file is part of MXE. See LICENSE.md for licensing information.
+
+Contains ad hoc patches for cross building with MinGW.
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MXE
+Date: Tue, 28 Jan 2025 00:00:00 +0000
+Subject: [PATCH] Add MinGW cross-compilation support
+
+This patch adds support for building MSQUIC with MinGW-w64 cross-compiler.
+Key changes:
+- Add MinGW platform detection in CMakeLists.txt
+- Create quic_platform_mingw.h compatibility header
+- Add stubs for MSVC-specific intrinsics and Windows SDK types
+- Handle ETW (Event Tracing for Windows) unavailability
+- Fix MSVC-specific compiler/linker flags
+
+diff -ruN a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt	2026-01-28 13:34:28
++++ b/CMakeLists.txt	2026-01-28 14:00:09
+@@ -60,7 +60,13 @@
+ set(QUIC_FULL_VERSION 2.5.6)
+ 
+ if (WIN32)
+-    set(CX_PLATFORM "windows")
++    if (MINGW OR CMAKE_C_COMPILER MATCHES "mingw")
++        message(STATUS "Detected MinGW cross-compilation")
++        set(CX_PLATFORM "mingw")
++        set(QUIC_TLS_LIB "quictls" CACHE STRING "TLS Library to use" FORCE)
++    else()
++        set(CX_PLATFORM "windows")
++    endif()
+ elseif (APPLE)
+     set(CX_PLATFORM "darwin")
+ elseif (UNIX)
+@@ -75,7 +81,7 @@
+ endif()
+ 
+ # Set the default TLS method for each platform.
+-if (WIN32)
++if (WIN32 AND NOT (MINGW OR CMAKE_C_COMPILER MATCHES "mingw"))
+     set(QUIC_TLS_LIB "schannel" CACHE STRING "TLS Library to use")
+ else()
+     set(QUIC_TLS_LIB "quictls" CACHE STRING "TLS Library to use")
+@@ -205,53 +211,16 @@
+ 
+ include(GNUInstallDirs)
+ 
+-if (WIN32)
++if (WIN32 AND NOT (MINGW OR CMAKE_C_COMPILER MATCHES "mingw"))
+     set(QUIC_WARNING_FLAGS /WX /W4 /sdl /wd4206 CACHE INTERNAL "")
+     set(QUIC_COMMON_FLAGS "")
+-
+-    include(CheckCCompilerFlag)
+-
+-    if(NOT QUIC_ENABLE_SANITIZERS)
+-        check_c_compiler_flag(/Qspectre HAS_SPECTRE)
+-    endif()
+-    if(HAS_SPECTRE)
+-        list(APPEND QUIC_COMMON_FLAGS /Qspectre)
+-    endif()
+-
+-    check_c_compiler_flag(/guard:cf HAS_GUARDCF)
+-    if(HAS_GUARDCF)
+-        list(APPEND QUIC_COMMON_FLAGS /guard:cf)
+-    endif()
+-
+-    # Require /Qspectre and /guard:cf in CI builds
+-    if(QUIC_CI AND NOT QUIC_SKIP_CI_CHECKS)
+-        if(NOT HAS_GUARDCF)
+-            message(FATAL_ERROR "/guard:cf must exist for CI builds")
+-        endif()
+-        if(NOT HAS_SPECTRE AND NOT QUIC_ENABLE_SANITIZERS AND NOT QUIC_UWP_BUILD)
+-            message(FATAL_ERROR "/Qspectre must exist for CI builds")
+-        endif()
+-    endif()
+-
+-    if (QUIC_ENABLE_SANITIZERS)
+-        message(STATUS "Allowing non-system32 DLLs to be loaded for ASAN")
+-    elseif (QUIC_GAMECORE_BUILD)
+-        message(STATUS "Allowing non-system32 DLLs to be loaded for GameCore")
+-    else()
+-        # Configure linker to only load from the system directory.
+-        message(STATUS "Configuring linker to only load from the system directory")
+-        set (CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /DEPENDENTLOADFLAG:0x800")
+-    endif()
+-
+-    if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
+-        list(APPEND QUIC_COMMON_FLAGS /MP)
+-    endif()
+     set(QUIC_COMMON_DEFINES WIN32_LEAN_AND_MEAN SECURITY_WIN32)
+-
+-    if(QUIC_ENABLE_LOGGING AND QUIC_LOGGING_TYPE STREQUAL "")
+-        set(QUIC_LOGGING_TYPE "etw")
+-        message(STATUS "Choosing etw as default logging type for platform")
+-    endif()
++elseif (MINGW OR CMAKE_C_COMPILER MATCHES "mingw")
++    # MinGW uses GCC flags - disable unknown pragma warnings due to MSVC pragmas
++    set(QUIC_WARNING_FLAGS -Wall -Wextra -Wno-unknown-pragmas CACHE INTERNAL "")
++    set(QUIC_COMMON_FLAGS "")
++    set(QUIC_COMMON_DEFINES WIN32_LEAN_AND_MEAN SECURITY_WIN32)
++    # MinGW doesn't support ETW logging
+ else()
+ 
+     include(CheckSymbolExists)
+@@ -468,38 +437,53 @@
+ endif()
+ 
+ if(WIN32)
+-    # Generate the MsQuicEtw header file.
+     file(MAKE_DIRECTORY ${QUIC_BUILD_DIR}/inc)
+ 
+-    if(NOT DEFINED CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH OR CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH)
+-        find_program(MC_EXE NAMES mc.exe)
+-        if(MC_EXE MATCHES "NOTFOUND")
+-            # If not found, then VS project generator will set %PATH% env var to WinSDK bin directory
+-            set(MC_EXE "mc.exe" CACHE STRING "mc.exe from %PATH%" FORCE)
+-        endif()
++    if(MINGW OR CMAKE_C_COMPILER MATCHES "mingw")
++        # MinGW: Generate stub ETW header since mc.exe is not available
++        message(STATUS "MinGW: Creating stub MsQuicEtw.h (ETW not supported)")
++        file(WRITE ${QUIC_BUILD_DIR}/inc/MsQuicEtw.h
++            "// Stub ETW header for MinGW\n"
++            "#pragma once\n"
++            "#define QUIC_ETW_ENABLED 0\n")
++
++        add_library(MsQuicEtw_Header INTERFACE)
++        target_include_directories(MsQuicEtw_Header INTERFACE
++            $<BUILD_INTERFACE:${QUIC_BUILD_DIR}/inc>
++            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+     else()
+-        find_program(MC_EXE NAMES mc.exe REQUIRED)
+-    endif()
++        # Generate the MsQuicEtw header file.
+ 
+-    add_custom_command(
+-        OUTPUT ${QUIC_BUILD_DIR}/inc/MsQuicEtw.h
+-        OUTPUT ${QUIC_BUILD_DIR}/inc/MsQuicEtw.rc
+-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/manifest/MsQuicEtw.man
+-        COMMAND "${MC_EXE}" -um -h ${QUIC_BUILD_DIR}/inc -r ${QUIC_BUILD_DIR}/inc ${CMAKE_CURRENT_SOURCE_DIR}/src/manifest/MsQuicEtw.man)
+-    add_custom_target(MsQuicEtw_HeaderBuild
+-        DEPENDS ${QUIC_BUILD_DIR}/inc/MsQuicEtw.h)
++        if(NOT DEFINED CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH OR CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH)
++            find_program(MC_EXE NAMES mc.exe)
++            if(MC_EXE MATCHES "NOTFOUND")
++                # If not found, then VS project generator will set %PATH% env var to WinSDK bin directory
++                set(MC_EXE "mc.exe" CACHE STRING "mc.exe from %PATH%" FORCE)
++            endif()
++        else()
++            find_program(MC_EXE NAMES mc.exe REQUIRED)
++        endif()
+ 
+-    set_property(TARGET MsQuicEtw_HeaderBuild PROPERTY FOLDER "${QUIC_FOLDER_PREFIX}helpers")
++        add_custom_command(
++            OUTPUT ${QUIC_BUILD_DIR}/inc/MsQuicEtw.h
++            OUTPUT ${QUIC_BUILD_DIR}/inc/MsQuicEtw.rc
++            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/manifest/MsQuicEtw.man
++            COMMAND "${MC_EXE}" -um -h ${QUIC_BUILD_DIR}/inc -r ${QUIC_BUILD_DIR}/inc ${CMAKE_CURRENT_SOURCE_DIR}/src/manifest/MsQuicEtw.man)
++        add_custom_target(MsQuicEtw_HeaderBuild
++            DEPENDS ${QUIC_BUILD_DIR}/inc/MsQuicEtw.h)
+ 
+-    add_library(MsQuicEtw_Header INTERFACE)
+-    target_include_directories(MsQuicEtw_Header INTERFACE
+-        $<BUILD_INTERFACE:${QUIC_BUILD_DIR}/inc>
+-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+-    add_dependencies(MsQuicEtw_Header MsQuicEtw_HeaderBuild)
++        set_property(TARGET MsQuicEtw_HeaderBuild PROPERTY FOLDER "${QUIC_FOLDER_PREFIX}helpers")
+ 
+-    add_library(MsQuicEtw_Resource OBJECT ${QUIC_BUILD_DIR}/inc/MsQuicEtw.rc)
+-    set_property(TARGET MsQuicEtw_Resource PROPERTY FOLDER "${QUIC_FOLDER_PREFIX}helpers")
++        add_library(MsQuicEtw_Header INTERFACE)
++        target_include_directories(MsQuicEtw_Header INTERFACE
++            $<BUILD_INTERFACE:${QUIC_BUILD_DIR}/inc>
++            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
++        add_dependencies(MsQuicEtw_Header MsQuicEtw_HeaderBuild)
+ 
++        add_library(MsQuicEtw_Resource OBJECT ${QUIC_BUILD_DIR}/inc/MsQuicEtw.rc)
++        set_property(TARGET MsQuicEtw_Resource PROPERTY FOLDER "${QUIC_FOLDER_PREFIX}helpers")
++    endif()
++
+     message(STATUS "Disabling (client) shared port support")
+     list(APPEND QUIC_COMMON_DEFINES QUIC_DISABLE_SHARED_PORT_TESTS)
+ 
+@@ -588,13 +572,17 @@
+     endif()
+ 
+     set(QUIC_C_FLAGS ${QUIC_COMMON_FLAGS})
+-    set(QUIC_CXX_FLAGS ${QUIC_COMMON_FLAGS} /EHsc /permissive-)
++    if(NOT (MINGW OR CMAKE_C_COMPILER MATCHES "mingw"))
++        set(QUIC_CXX_FLAGS ${QUIC_COMMON_FLAGS} /EHsc /permissive-)
+ 
+-    # These cannot be updated until CMake 3.13
+-    set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /GL /Zi")
+-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /GL /Zi")
+-    set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} /LTCG /IGNORE:4075 /DEBUG /OPT:REF /OPT:ICF")
+-    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /LTCG /IGNORE:4075 /DEBUG /OPT:REF /OPT:ICF")
++        # These cannot be updated until CMake 3.13
++        set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /GL /Zi")
++        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /GL /Zi")
++        set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} /LTCG /IGNORE:4075 /DEBUG /OPT:REF /OPT:ICF")
++        set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /LTCG /IGNORE:4075 /DEBUG /OPT:REF /OPT:ICF")
++    else()
++        set(QUIC_CXX_FLAGS ${QUIC_COMMON_FLAGS})
++    endif()
+ 
+     # Find the right PGO file.
+     if(NOT EXISTS "${QUIC_PGO_FILE}")
+@@ -634,7 +622,7 @@
+         set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+     endif()
+ 
+-    if(QUIC_STATIC_LINK_PARTIAL_CRT)
++    if(QUIC_STATIC_LINK_PARTIAL_CRT AND NOT (MINGW OR CMAKE_C_COMPILER MATCHES "mingw"))
+         message(STATUS "Configuring for partially statically-linked CRT")
+         set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} /NODEFAULTLIB:libucrt.lib /DEFAULTLIB:ucrt.lib")
+     endif()
+@@ -700,19 +688,32 @@
+ if(QUIC_TLS_LIB STREQUAL "quictls")
+     add_library(OpenSSL INTERFACE)
+ 
+-    include(FetchContent)
++    if(MINGW OR CMAKE_C_COMPILER MATCHES "mingw")
++        # MinGW: use system OpenSSL directly
++        find_package(OpenSSL REQUIRED)
++        if(OPENSSL_FOUND)
++            message(STATUS "Using system OpenSSL for MinGW: ${OPENSSL_VERSION}")
++            target_link_libraries(OpenSSL INTERFACE OpenSSL::SSL OpenSSL::Crypto)
++            target_include_directories(OpenSSL INTERFACE ${OPENSSL_INCLUDE_DIR})
++            list(APPEND QUIC_COMMON_DEFINES CXPLAT_SYSTEM_CRYPTO)
++        else()
++            message(FATAL_ERROR "OpenSSL not found for MinGW build")
++        endif()
++    else()
++        include(FetchContent)
+ 
+-    FetchContent_Declare(
+-        OpenSSLQuic
+-        SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/submodules
+-        CMAKE_ARGS "-DQUIC_USE_SYSTEM_LIBCRYPTO=${QUIC_USE_SYSTEM_LIBCRYPTO}"
+-    )
+-    FetchContent_MakeAvailable(OpenSSLQuic)
++        FetchContent_Declare(
++            OpenSSLQuic
++            SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/submodules
++            CMAKE_ARGS "-DQUIC_USE_SYSTEM_LIBCRYPTO=${QUIC_USE_SYSTEM_LIBCRYPTO}"
++        )
++        FetchContent_MakeAvailable(OpenSSLQuic)
+ 
+-    target_link_libraries(OpenSSL
+-        INTERFACE
+-        OpenSSLQuic::OpenSSLQuic
+-    )
++        target_link_libraries(OpenSSL
++            INTERFACE
++            OpenSSLQuic::OpenSSLQuic
++        )
++    endif()
+ endif()
+ 
+ if (QUIC_USE_SYSTEM_LIBCRYPTO)
+diff -ruN a/src/bin/CMakeLists.txt b/src/bin/CMakeLists.txt
+--- a/src/bin/CMakeLists.txt	2026-01-28 13:34:28
++++ b/src/bin/CMakeLists.txt	2026-01-28 13:36:55
+@@ -1,10 +1,15 @@
+ # Copyright (c) Microsoft Corporation.
+ # Licensed under the MIT License.
+ 
+-if(WIN32)
++if(WIN32 AND NOT (MINGW OR CMAKE_C_COMPILER MATCHES "mingw"))
+     configure_file(winuser/msquic.rc.in ${CMAKE_CURRENT_BINARY_DIR}/msquic.rc )
+     configure_file(winuser/msquic.def.in ${CMAKE_CURRENT_BINARY_DIR}/msquic.def )
+     set(SOURCES winuser/dllmain.c ${CMAKE_CURRENT_BINARY_DIR}/msquic.rc $<TARGET_OBJECTS:MsQuicEtw_Resource>)
++elseif(MINGW OR CMAKE_C_COMPILER MATCHES "mingw")
++    # MinGW: use simplified sources without ETW resources
++    configure_file(winuser/msquic.rc.in ${CMAKE_CURRENT_BINARY_DIR}/msquic.rc )
++    configure_file(winuser/msquic.def.in ${CMAKE_CURRENT_BINARY_DIR}/msquic.def )
++    set(SOURCES winuser/dllmain.c ${CMAKE_CURRENT_BINARY_DIR}/msquic.rc)
+ else()
+     set(SOURCES linux/init.c)
+ endif()
+@@ -152,7 +157,7 @@
+             DEPENDS msquic_platform
+             DEPENDS msquic_static
+         )
+-    elseif(WIN32)
++    elseif(WIN32 AND NOT (MINGW OR CMAKE_C_COMPILER MATCHES "mingw"))
+         set(NODEFAULTS "")
+         foreach(EXCLUDE ${EXCLUDE_LIST})
+             string(APPEND NODEFAULTS "/NODEFAULTLIB:${EXCLUDE}${CMAKE_STATIC_LIBRARY_SUFFIX} ")
+@@ -238,7 +243,7 @@
+ 
+ set_property(TARGET msquic PROPERTY FOLDER "${QUIC_FOLDER_PREFIX}libraries")
+ 
+-if(WIN32)
++if(WIN32 AND NOT (MINGW OR CMAKE_C_COMPILER MATCHES "mingw"))
+     set(MSQUIC_LINK_FLAGS "/DEF:\"${CMAKE_CURRENT_BINARY_DIR}/msquic.def\"")
+ 
+     # Indicate CET Shadow Stack support for supported architectures
+@@ -265,7 +270,10 @@
+ file(GLOB PUBLIC_HEADERS "../inc/*.h" "../inc/*.hpp")
+ 
+ if(QUIC_TLS_LIB STREQUAL "quictls")
+-    list(APPEND OTHER_TARGETS OpenSSL OpenSSLQuic)
++    list(APPEND OTHER_TARGETS OpenSSL)
++    if(TARGET OpenSSLQuic AND NOT (MINGW OR CMAKE_C_COMPILER MATCHES "mingw"))
++        list(APPEND OTHER_TARGETS OpenSSLQuic)
++    endif()
+ endif()
+ 
+ if(WIN32)
+diff -ruN a/src/inc/CMakeLists.txt b/src/inc/CMakeLists.txt
+--- a/src/inc/CMakeLists.txt	2026-01-28 13:34:28
++++ b/src/inc/CMakeLists.txt	2026-01-28 13:37:03
+@@ -62,6 +62,6 @@
+ target_compile_options(warnings INTERFACE ${QUIC_WARNING_FLAGS})
+ 
+ add_library(main_binary_link_args INTERFACE)
+-if (WIN32 AND NOT BUILD_SHARED_LIBS)
++if (WIN32 AND NOT BUILD_SHARED_LIBS AND NOT (MINGW OR CMAKE_C_COMPILER MATCHES "mingw"))
+     target_compile_options(main_binary_link_args INTERFACE /Zl)
+ endif()
+diff -ruN a/src/inc/msquic_winuser.h b/src/inc/msquic_winuser.h
+--- a/src/inc/msquic_winuser.h	2026-01-28 13:34:28
++++ b/src/inc/msquic_winuser.h	2026-01-28 13:37:11
+@@ -38,7 +38,9 @@
+ 
+ #include <stdint.h>
+ 
++#ifndef QUIC_INLINE
+ #define QUIC_INLINE inline
++#endif
+ 
+ #define SUCCESS_HRESULT_FROM_WIN32(x) \
+     ((HRESULT)(((x) & 0x0000FFFF) | (FACILITY_WIN32 << 16)))
+diff -ruN a/src/inc/quic_platform.h b/src/inc/quic_platform.h
+--- a/src/inc/quic_platform.h	2026-01-28 13:34:28
++++ b/src/inc/quic_platform.h	2026-01-28 13:37:19
+@@ -64,6 +64,12 @@
+ typedef struct CXPLAT_SLIST_ENTRY {
+     struct CXPLAT_SLIST_ENTRY* Next;
+ } CXPLAT_SLIST_ENTRY;
++
++// Early FORCEINLINE definition for MinGW (before quic_platform_mingw.h is included)
++#if defined(__MINGW32__) || defined(__MINGW64__)
++#define FORCEINLINE static __inline__ __attribute__((always_inline))
++#endif
+ 
+ #ifndef FORCEINLINE
+ #if (_MSC_VER >= 1200)
+ #define FORCEINLINE __forceinline
+ #else
+ #define FORCEINLINE QUIC_INLINE
+ #endif
+ #endif
+ 
+ //
+ // Different pool tags used for marking allocations.
+ //
+@@ -172,7 +172,11 @@
+ #ifdef _KERNEL_MODE
+ #define CX_PLATFORM_TYPE 1
+ #include "quic_platform_winkernel.h"
+-#elif _WIN32
++#elif defined(__MINGW32__) || defined(__MINGW64__)
++#define CX_PLATFORM_TYPE 5
++#define CX_PLATFORM_MINGW 1
++#include "quic_platform_mingw.h"
++#elif defined(_WIN32)
+ #define CX_PLATFORM_TYPE 2
+ #include "quic_platform_winuser.h"
+ #elif CX_PLATFORM_LINUX
+diff -ruN a/src/inc/quic_platform_mingw.h b/src/inc/quic_platform_mingw.h
+--- a/src/inc/quic_platform_mingw.h	1969-12-31 19:00:00
++++ b/src/inc/quic_platform_mingw.h	2026-01-28 14:05:01
+@@ -0,0 +1,509 @@
++/*++
++
++    Copyright (c) Microsoft Corporation.
++    Licensed under the MIT License.
++
++Abstract:
++
++    This file provides MinGW (GCC) compatibility and then includes the
++    Windows user mode platform header.
++
++Environment:
++
++    Windows user mode via MinGW-w64 cross-compiler
++
++--*/
++
++#pragma once
++
++#ifndef CX_PLATFORM_TYPE
++#error "Must be included from quic_platform.h"
++#endif
++
++//
++// SAL annotations must be stubbed out BEFORE including Windows headers
++//
++#include "quic_sal_stub.h"
++
++// MinGW doesn't have __noop - make it variadic to accept arguments
++#ifdef __noop
++#undef __noop
++#endif
++#define __noop(...) ((void)0)
++
++// __annotation is MSVC-specific - must produce an expression, not nothing
++#ifdef __annotation
++#undef __annotation
++#endif
++#define __annotation(...) ((void)0)
++
++// DECLSPEC_ALLOCATOR is MSVC-specific
++#ifndef DECLSPEC_ALLOCATOR
++#define DECLSPEC_ALLOCATOR
++#endif
++
++// E_NOT_VALID_STATE may not be defined in MinGW
++#ifndef E_NOT_VALID_STATE
++#define E_NOT_VALID_STATE ((HRESULT)0x8007139FL)
++#endif
++
++// MSVC interlocked intrinsics not in MinGW - use GCC builtins
++#ifndef InterlockedIncrementNoFence64
++#define InterlockedIncrementNoFence64(Addend) __sync_add_and_fetch((int64_t volatile*)(Addend), 1)
++#endif
++
++#ifndef InterlockedDecrementRelease64
++#define InterlockedDecrementRelease64(Addend) __sync_sub_and_fetch((int64_t volatile*)(Addend), 1)
++#endif
++
++#ifndef ReadNoFence64
++#define ReadNoFence64(Source) (*(volatile int64_t*)(Source))
++#endif
++
++#ifndef InterlockedCompareExchangeNoFence64
++#define InterlockedCompareExchangeNoFence64(Destination, Exchange, Comperand) \
++    __sync_val_compare_and_swap((int64_t volatile*)(Destination), (Comperand), (Exchange))
++#endif
++
++// 8-bit interlocked operations for MinGW
++#ifndef _InterlockedAnd8
++static __inline__ char _InterlockedAnd8(volatile char* Destination, char Value) {
++    return __sync_fetch_and_and(Destination, Value);
++}
++#endif
++
++#ifndef _InterlockedOr8
++static __inline__ char _InterlockedOr8(volatile char* Destination, char Value) {
++    return __sync_fetch_and_or(Destination, Value);
++}
++#endif
++
++// __kernel_entry is MSVC/NT specific
++#ifndef __kernel_entry
++#define __kernel_entry
++#endif
++
++#ifndef ReadPointerNoFence
++#define ReadPointerNoFence(Source) (*(void* volatile*)(Source))
++#endif
++
++// __analysis_assert is MSVC static analysis
++#ifndef __analysis_assert
++#define __analysis_assert(expr) ((void)0)
++#endif
++
++// FAST_FAIL codes
++#ifndef FAST_FAIL_INVALID_REFERENCE_COUNT
++#define FAST_FAIL_INVALID_REFERENCE_COUNT 0x18
++#endif
++
++// __fastfail is MSVC-specific, use abort() on MinGW
++#include <stdlib.h>
++#ifndef __fastfail
++#define __fastfail(code) abort()
++#endif
++
++// QUIC_INLINE for GCC
++#ifndef QUIC_INLINE
++#define QUIC_INLINE static __inline__ __attribute__((always_inline))
++#endif
++
++// _Static_assert for C11 compatibility with GCC
++#ifndef __cplusplus
++#ifndef static_assert
++#define static_assert _Static_assert
++#endif
++#endif
++
++// Define CXPLAT_STATIC_ASSERT before including winuser header
++#ifndef CXPLAT_STATIC_ASSERT
++#define CXPLAT_STATIC_ASSERT(X,Y) _Static_assert(X, Y)
++#endif
++
++//
++// Include Windows headers first to get their definitions
++// We'll override problematic ones after
++//
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN 1
++#endif
++
++// Fix MinGW winnt.h inconsistency:
++// winnt.h declares NtCurrentTeb() etc. as non-static prototypes, then defines
++// them as FORCEINLINE (static inline). This causes "static declaration follows
++// non-static declaration" errors. Redefine FORCEINLINE to remove 'static'.
++#ifdef FORCEINLINE
++#undef FORCEINLINE
++#endif
++#define FORCEINLINE __inline__ __attribute__((always_inline))
++
++#include <windows.h>
++
++// Restore FORCEINLINE to proper static inline for other uses
++#undef FORCEINLINE
++#define FORCEINLINE static __inline__ __attribute__((always_inline))
++#include <winsock2.h>
++#include <ws2tcpip.h>
++
++//
++// winternl.h types and functions needed by msquic but not in MinGW
++//
++
++// NTSTATUS is typedef'd in winnt.h but we need it for function declarations
++#ifndef NTSTATUS
++typedef LONG NTSTATUS;
++#endif
++
++// NT_SUCCESS macro from ntdef.h - checks if NTSTATUS is success
++#ifndef NT_SUCCESS
++#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
++#endif
++
++// UNICODE_STRING structure from winternl.h
++#ifndef _UNICODE_STRING_DEFINED
++#define _UNICODE_STRING_DEFINED
++typedef struct _UNICODE_STRING {
++    USHORT Length;
++    USHORT MaximumLength;
++    PWSTR  Buffer;
++} UNICODE_STRING, *PUNICODE_STRING;
++#endif
++
++// THREADINFOCLASS enum from winternl.h (only the value we need)
++#ifndef THREADINFOCLASS
++typedef enum _THREADINFOCLASS {
++    ThreadBasicInformation = 0,
++    ThreadTimes = 1,
++    ThreadPriority = 2,
++    ThreadBasePriority = 3,
++    ThreadAffinityMask = 4,
++    ThreadImpersonationToken = 5,
++    ThreadDescriptorTableEntry = 6,
++    ThreadEnableAlignmentFaultFixup = 7,
++    ThreadEventPair_Reusable = 8,
++    ThreadQuerySetWin32StartAddress = 9,
++    ThreadZeroTlsCell = 10,
++    ThreadPerformanceCount = 11,
++    ThreadAmILastThread = 12,
++    ThreadIdealProcessor = 13,
++    ThreadPriorityBoost = 14,
++    ThreadSetTlsArrayAddress = 15,
++    ThreadIsIoPending = 16,
++    ThreadHideFromDebugger = 17
++} THREADINFOCLASS;
++#endif
++
++// RtlNtStatusToDosError is used to convert NT status codes
++#ifndef RtlNtStatusToDosError
++NTSYSAPI ULONG NTAPI RtlNtStatusToDosError(NTSTATUS Status);
++#endif
++
++//
++// IPv6 helper macros not available in MinGW
++// These are from the Windows SDK mstcpip.h
++//
++
++// IN6ADDR_SETV4MAPPED - Initialize an IPv6 address with an IPv4-mapped address
++#ifndef IN6ADDR_SETV4MAPPED
++#define IN6ADDR_SETV4MAPPED(Ipv6Address, Ipv4Address, ScopeId, Port) \
++    do { \
++        (Ipv6Address)->sin6_family = AF_INET6; \
++        (Ipv6Address)->sin6_port = (Port); \
++        (Ipv6Address)->sin6_flowinfo = 0; \
++        (Ipv6Address)->sin6_addr.s6_addr[0] = 0; \
++        (Ipv6Address)->sin6_addr.s6_addr[1] = 0; \
++        (Ipv6Address)->sin6_addr.s6_addr[2] = 0; \
++        (Ipv6Address)->sin6_addr.s6_addr[3] = 0; \
++        (Ipv6Address)->sin6_addr.s6_addr[4] = 0; \
++        (Ipv6Address)->sin6_addr.s6_addr[5] = 0; \
++        (Ipv6Address)->sin6_addr.s6_addr[6] = 0; \
++        (Ipv6Address)->sin6_addr.s6_addr[7] = 0; \
++        (Ipv6Address)->sin6_addr.s6_addr[8] = 0; \
++        (Ipv6Address)->sin6_addr.s6_addr[9] = 0; \
++        (Ipv6Address)->sin6_addr.s6_addr[10] = 0xff; \
++        (Ipv6Address)->sin6_addr.s6_addr[11] = 0xff; \
++        *((ULONG*)&(Ipv6Address)->sin6_addr.s6_addr[12]) = *((ULONG*)(Ipv4Address)); \
++        (Ipv6Address)->sin6_scope_id = (ScopeId).Value; \
++    } while (0)
++#endif
++
++// IN6_GET_ADDR_V4MAPPED - Get pointer to the IPv4 address within a mapped IPv6 address
++#ifndef IN6_GET_ADDR_V4MAPPED
++#define IN6_GET_ADDR_V4MAPPED(Ipv6Address) \
++    ((IN_ADDR*)&(Ipv6Address)->s6_addr[12])
++#endif
++
++// Now fix UNREFERENCED_PARAMETER for const parameters
++// Must be after windows.h which includes winnt.h that defines it
++#ifdef UNREFERENCED_PARAMETER
++#undef UNREFERENCED_PARAMETER
++#endif
++#define UNREFERENCED_PARAMETER(P) (void)(P)
++
++//
++// BCrypt pseudo-handles not defined in MinGW
++// These are special handles that don't need to be opened/closed
++//
++#ifndef BCRYPT_SHA1_ALG_HANDLE
++#define BCRYPT_SHA1_ALG_HANDLE      ((BCRYPT_ALG_HANDLE)0x00000011)
++#endif
++#ifndef BCRYPT_SHA256_ALG_HANDLE
++#define BCRYPT_SHA256_ALG_HANDLE    ((BCRYPT_ALG_HANDLE)0x00000041)
++#endif
++#ifndef BCRYPT_SHA384_ALG_HANDLE
++#define BCRYPT_SHA384_ALG_HANDLE    ((BCRYPT_ALG_HANDLE)0x00000051)
++#endif
++#ifndef BCRYPT_SHA512_ALG_HANDLE
++#define BCRYPT_SHA512_ALG_HANDLE    ((BCRYPT_ALG_HANDLE)0x00000061)
++#endif
++
++//
++// Winsock errors not defined in MinGW
++//
++#ifndef WSA_SECURE_HOST_NOT_FOUND
++#define WSA_SECURE_HOST_NOT_FOUND   (WSABASEERR + 1032)
++#endif
++
++//
++// IPv4 helper macros not defined in MinGW
++//
++#ifndef IN4_IS_ADDR_LOOPBACK
++#define IN4_IS_ADDR_LOOPBACK(a) ((((ULONG*)(a))[0] & 0x000000ff) == 0x7f)
++#endif
++
++// DbgRaiseAssertionFailure is MSVC-specific
++// MinGW has __debugbreak as a compiler intrinsic
++#ifndef DbgRaiseAssertionFailure
++extern void __cdecl __debugbreak(void);
++#define DbgRaiseAssertionFailure() __debugbreak()
++#endif
++
++//
++// RIO (Registered I/O) stubs for MinGW
++// RIO is not supported on MinGW, but we need these types to compile
++//
++
++#ifndef RIO_BUFFERID
++typedef void* RIO_BUFFERID;
++#endif
++#ifndef RIO_CQ
++typedef void* RIO_CQ;
++#endif
++#ifndef RIO_RQ
++typedef void* RIO_RQ;
++#endif
++
++#ifndef RIO_INVALID_CQ
++#define RIO_INVALID_CQ ((RIO_CQ)NULL)
++#endif
++#ifndef RIO_INVALID_RQ
++#define RIO_INVALID_RQ ((RIO_RQ)NULL)
++#endif
++#ifndef RIO_INVALID_BUFFERID
++#define RIO_INVALID_BUFFERID ((RIO_BUFFERID)NULL)
++#endif
++
++#ifndef RIO_CMSG_BASE_SIZE
++#define RIO_CMSG_BASE_SIZE 0
++#endif
++
++#ifndef RIO_IOCP_COMPLETION
++#define RIO_IOCP_COMPLETION 1
++#endif
++
++#ifndef RIO_CORRUPT_CQ
++#define RIO_CORRUPT_CQ 0xFFFFFFFF
++#endif
++
++// RIO notification completion structure
++#ifndef _RIO_NOTIFICATION_COMPLETION_DEFINED
++#define _RIO_NOTIFICATION_COMPLETION_DEFINED
++typedef struct _RIO_NOTIFICATION_COMPLETION {
++    DWORD Type;
++    union {
++        struct {
++            HANDLE IocpHandle;
++            PVOID CompletionKey;
++            PVOID Overlapped;
++        } Iocp;
++    };
++} RIO_NOTIFICATION_COMPLETION, *PRIO_NOTIFICATION_COMPLETION;
++#endif
++
++// RIO buffer structure
++#ifndef _RIO_BUF_DEFINED
++#define _RIO_BUF_DEFINED
++typedef struct _RIO_BUF {
++    RIO_BUFFERID BufferId;
++    ULONG Offset;
++    ULONG Length;
++} RIO_BUF, *PRIO_BUF;
++#endif
++
++// RIO result structure
++#ifndef _RIORESULT_DEFINED
++#define _RIORESULT_DEFINED
++typedef struct _RIORESULT {
++    LONG Status;
++    ULONG BytesTransferred;
++    ULONGLONG SocketContext;
++    ULONGLONG RequestContext;
++} RIORESULT, *PRIORESULT;
++#endif
++
++// RIO message flags
++#ifndef RIO_MSG_DEFER
++#define RIO_MSG_DEFER 0x00000002
++#endif
++#ifndef RIO_MSG_COMMIT_ONLY
++#define RIO_MSG_COMMIT_ONLY 0x00000008
++#endif
++
++// RIO function pointer types
++typedef BOOL (PASCAL * LPFN_RIONOTIFY)(RIO_CQ);
++typedef RIO_CQ (PASCAL * LPFN_RIOCREATECOMPLETIONQUEUE)(DWORD, PRIO_NOTIFICATION_COMPLETION);
++typedef RIO_RQ (PASCAL * LPFN_RIOCREATEREQUESTQUEUE)(SOCKET, ULONG, ULONG, ULONG, ULONG, RIO_CQ, RIO_CQ, PVOID);
++typedef VOID (PASCAL * LPFN_RIOCLOSECOMPLETIONQUEUE)(RIO_CQ);
++typedef BOOL (PASCAL * LPFN_RIORESIZECOMPLETIONQUEUE)(RIO_CQ, DWORD);
++typedef BOOL (PASCAL * LPFN_RIORESIZEREQUESTQUEUE)(RIO_RQ, DWORD, DWORD);
++typedef RIO_BUFFERID (PASCAL * LPFN_RIOREGISTERBUFFER)(PCHAR, DWORD);
++typedef VOID (PASCAL * LPFN_RIODEREGISTERBUFFER)(RIO_BUFFERID);
++typedef BOOL (PASCAL * LPFN_RIOSEND)(RIO_RQ, PRIO_BUF, ULONG, DWORD, PVOID);
++typedef BOOL (PASCAL * LPFN_RIOSENDEX)(RIO_RQ, PRIO_BUF, ULONG, PRIO_BUF, PRIO_BUF, PRIO_BUF, PRIO_BUF, DWORD, PVOID);
++typedef BOOL (PASCAL * LPFN_RIORECEIVE)(RIO_RQ, PRIO_BUF, ULONG, DWORD, PVOID);
++typedef INT (PASCAL * LPFN_RIORECEIVEEX)(RIO_RQ, PRIO_BUF, ULONG, PRIO_BUF, PRIO_BUF, PRIO_BUF, PRIO_BUF, DWORD, PVOID);
++typedef ULONG (PASCAL * LPFN_RIODEQUEUECOMPLETION)(RIO_CQ, PRIORESULT, ULONG);
++
++// RIO extension function table with proper function pointers
++#ifndef _RIO_EXTENSION_FUNCTION_TABLE_DEFINED
++#define _RIO_EXTENSION_FUNCTION_TABLE_DEFINED
++typedef struct _RIO_EXTENSION_FUNCTION_TABLE {
++    DWORD cbSize;
++    LPFN_RIORECEIVE RIOReceive;
++    LPFN_RIORECEIVEEX RIOReceiveEx;
++    LPFN_RIOSEND RIOSend;
++    LPFN_RIOSENDEX RIOSendEx;
++    LPFN_RIOCLOSECOMPLETIONQUEUE RIOCloseCompletionQueue;
++    LPFN_RIOCREATECOMPLETIONQUEUE RIOCreateCompletionQueue;
++    LPFN_RIOCREATEREQUESTQUEUE RIOCreateRequestQueue;
++    LPFN_RIODEQUEUECOMPLETION RIODequeueCompletion;
++    LPFN_RIODEREGISTERBUFFER RIODeregisterBuffer;
++    LPFN_RIONOTIFY RIONotify;
++    LPFN_RIOREGISTERBUFFER RIORegisterBuffer;
++    LPFN_RIORESIZECOMPLETIONQUEUE RIOResizeCompletionQueue;
++    LPFN_RIORESIZEREQUESTQUEUE RIOResizeRequestQueue;
++} RIO_EXTENSION_FUNCTION_TABLE, *PRIO_EXTENSION_FUNCTION_TABLE;
++#endif
++
++// RIO GUID - not used but needed for compilation
++#ifndef WSAID_MULTIPLE_RIO
++static const GUID WSAID_MULTIPLE_RIO_GUID = {0};
++#define WSAID_MULTIPLE_RIO WSAID_MULTIPLE_RIO_GUID
++#endif
++
++//
++// RSS (Receive Side Scaling) types for MinGW
++//
++#ifndef SIO_QUERY_RSS_SCALABILITY_INFO
++#define SIO_QUERY_RSS_SCALABILITY_INFO 0x98000008
++#endif
++
++#ifndef SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER
++#define SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER 0xC8000024
++#endif
++
++#ifndef _RSS_SCALABILITY_INFO_DEFINED
++#define _RSS_SCALABILITY_INFO_DEFINED
++typedef struct _RSS_SCALABILITY_INFO {
++    BOOLEAN RssEnabled;
++} RSS_SCALABILITY_INFO, *PRSS_SCALABILITY_INFO;
++#endif
++
++//
++// GetAdaptersAddresses flags not in MinGW
++//
++#ifndef GAA_FLAG_SKIP_DNS_INFO
++#define GAA_FLAG_SKIP_DNS_INFO 0x0800
++#endif
++
++//
++// RSS processor info for MinGW
++//
++#ifndef SIO_QUERY_RSS_PROCESSOR_INFO
++#define SIO_QUERY_RSS_PROCESSOR_INFO 0x4800000C
++#endif
++
++#ifndef _SOCKET_PROCESSOR_AFFINITY_DEFINED
++#define _SOCKET_PROCESSOR_AFFINITY_DEFINED
++typedef struct _SOCKET_PROCESSOR_AFFINITY {
++    PROCESSOR_NUMBER Processor;
++    USHORT NumaNodeId;
++    USHORT Reserved;
++} SOCKET_PROCESSOR_AFFINITY, *PSOCKET_PROCESSOR_AFFINITY;
++#endif
++
++//
++// IN6ADDR_ISV4MAPPED not in MinGW
++//
++#ifndef IN6ADDR_ISV4MAPPED
++#define IN6ADDR_ISV4MAPPED(a) IN6_IS_ADDR_V4MAPPED(&(a)->sin6_addr)
++#endif
++
++//
++// RIO CMSG buffer type
++//
++#ifndef _RIO_CMSG_BUFFER_DEFINED
++#define _RIO_CMSG_BUFFER_DEFINED
++typedef struct _RIO_CMSG_BUFFER {
++    ULONG TotalLength;
++} RIO_CMSG_BUFFER, *PRIO_CMSG_BUFFER;
++#endif
++
++//
++// CMSG macros that map to WSA versions for MinGW
++//
++#ifndef CMSG_FIRSTHDR
++#define CMSG_FIRSTHDR WSA_CMSG_FIRSTHDR
++#endif
++#ifndef CMSG_NXTHDR
++#define CMSG_NXTHDR WSA_CMSG_NXTHDR
++#endif
++#ifndef CMSG_DATA
++#define CMSG_DATA WSA_CMSG_DATA
++#endif
++
++//
++// Pointer types for IP_PKTINFO not in MinGW
++//
++#ifndef PIN_PKTINFO
++typedef struct in_pktinfo* PIN_PKTINFO;
++#endif
++#ifndef PIN6_PKTINFO
++typedef struct in6_pktinfo* PIN6_PKTINFO;
++#endif
++
++//
++// Override CX_PLATFORM_TYPE to use Windows user mode header
++//
++#undef CX_PLATFORM_TYPE
++#define CX_PLATFORM_TYPE 2
++
++// Include the Windows user mode platform header
++#include "quic_platform_winuser.h"
++
++// Restore MinGW platform type
++#undef CX_PLATFORM_TYPE
++#define CX_PLATFORM_TYPE 5
++
++#undef INIT_NO_SAL
++#define INIT_NO_SAL(X) // No SAL support in MinGW
++
++// Fix UNREFERENCED_PARAMETER again after quic_platform_winuser.h
++// in case it was redefined
++#ifdef UNREFERENCED_PARAMETER
++#undef UNREFERENCED_PARAMETER
++#endif
++#define UNREFERENCED_PARAMETER(P) (void)(P)
++
++// Extern for CxPlatTotalMemory - implemented in platform_winuser.c
++extern uint64_t CxPlatTotalMemory;
+diff -ruN a/src/inc/quic_platform_winuser.h b/src/inc/quic_platform_winuser.h
+--- a/src/inc/quic_platform_winuser.h	2026-01-28 13:34:28
++++ b/src/inc/quic_platform_winuser.h	2026-01-28 13:47:45
+@@ -42,7 +42,9 @@
+ #include <iphlpapi.h>
+ #include <bcrypt.h>
+ #include <stdlib.h>
++#ifndef __MINGW32__
+ #include <winternl.h>
++#endif
+ #include "msquic_winuser.h"
+ #ifdef _M_X64
+ #pragma warning(disable:28251) // Inconsistent annotation for function
+diff -ruN a/src/platform/CMakeLists.txt b/src/platform/CMakeLists.txt
+--- a/src/platform/CMakeLists.txt	2026-01-28 13:34:28
++++ b/src/platform/CMakeLists.txt	2026-01-28 13:55:03
+@@ -22,6 +22,9 @@
+     else()
+         set(SOURCES ${SOURCES} datapath_raw.c datapath_raw_win.c datapath_raw_socket.c datapath_raw_socket_win.c datapath_raw_xdp_win.c)
+     endif()
++elseif("${CX_PLATFORM}" STREQUAL "mingw")
++    # MinGW uses platform_winuser.c with Windows storage (same as native Windows)
++    set(SOURCES ${SOURCES} platform_winuser.c storage_winuser.c datapath_win.c datapath_winuser.c datapath_xplat.c datapath_raw_dummy.c)
+ else()
+     set(SOURCES ${SOURCES} platform_posix.c storage_posix.c cgroup.c datapath_unix.c)
+     if(CX_PLATFORM STREQUAL "linux" AND NOT CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+@@ -50,6 +53,9 @@
+     set(SOURCES ${SOURCES} tls_quictls.c crypt_openssl.c)
+     if ("${CX_PLATFORM}" STREQUAL "windows")
+         set(SOURCES ${SOURCES} certificates_capi.c cert_capi.c  selfsign_capi.c)
++    elseif("${CX_PLATFORM}" STREQUAL "mingw")
++        # MinGW uses OpenSSL with Windows CAPI certificates
++        set(SOURCES ${SOURCES} certificates_capi.c cert_capi.c selfsign_capi.c)
+     elseif(CX_PLATFORM STREQUAL "linux")
+         set(SOURCES ${SOURCES} certificates_posix.c selfsign_openssl.c)
+     else()
+@@ -69,6 +75,14 @@
+         PUBLIC
+         wbemuuid)
+     target_link_libraries(msquic_platform PUBLIC winmm)
++elseif("${CX_PLATFORM}" STREQUAL "mingw")
++    # MinGW Windows libraries
++    target_link_libraries(msquic_platform PUBLIC ws2_32 iphlpapi bcrypt ncrypt crypt32 advapi32 winmm ntdll)
++    # MinGW has multiple definitions of inline functions from headers - allow them
++    target_link_options(msquic_platform PUBLIC "LINKER:--allow-multiple-definition")
++    # MinGW's winnt.h has conflicting static/non-static declarations
++    # Use compiler flag to ignore this specific warning as error
++    target_compile_options(msquic_platform PRIVATE -Wno-error)
+ elseif(QUIC_LINUX_XDP_ENABLED)
+     find_library(NL_LIB nl-3)
+     find_library(NL_ROUTE_LIB nl-route-3)
+diff -ruN a/src/platform/cert_capi.c b/src/platform/cert_capi.c
+--- a/src/platform/cert_capi.c	2026-01-28 13:34:28
++++ b/src/platform/cert_capi.c	2026-01-28 13:37:59
+@@ -1486,7 +1486,7 @@
+ 
+     BOOLEAN Result = FALSE;
+     BYTE HashBuf[CXPLAT_CERTIFICATE_MAX_HASH_SIZE] = { 0 };
+-    BCRYPT_KEY_HANDLE PublicKey = (ULONG_PTR)NULL;
++    BCRYPT_KEY_HANDLE PublicKey = NULL;
+     CXPLAT_SIGN_PADDING Padding = { 0 };
+ 
+     NTSTATUS Status =
